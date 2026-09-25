@@ -1,0 +1,27 @@
+{
+  "timezone": "America/New_York",
+  "sources": {
+    "bls_calendar": true,
+    "bea_schedule": true,
+    "federal_reserve": true,
+    "bybit_context": true,
+    "fred_cross_market": false
+  },
+  "rss": [
+    {
+      "name": "federal_reserve_speeches",
+      "url": "https://www.federalreserve.gov/feeds/speeches.xml",
+      "publisher": "Federal Reserve Board",
+      "trusted": true
+    },
+    {
+      "name": "federal_reserve_monetary_policy",
+      "url": "https://www.federalreserve.gov/feeds/press_monetary.xml",
+      "publisher": "Federal Reserve Board",
+      "trusted": true
+    }
+  ],
+  "bybit_symbols": ["BTCUSDT", "ETHUSDT"],
+  "fred_series": ["DGS10", "DTWEXBGS", "SP500", "VIXCLS"]
+}
+

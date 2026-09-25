@@ -1,0 +1,13 @@
+[project]
+name = "new-orayan-market-intelligence"
+version = "0.1.0"
+description = "Independent, failure-tolerant market context collector for offline New Orayan research"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+orayan-market-intel = "market_intelligence.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
