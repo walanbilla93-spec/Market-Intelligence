@@ -1,0 +1,21 @@
+{
+  "schema_version": "MARKET_INTELLIGENCE_MANIFEST_V1",
+  "snapshot_id": "mis_sample_not_for_research",
+  "watermark_utc": "2026-09-25T16:01:00Z",
+  "file_count": 2,
+  "row_count": 2,
+  "files": [
+    {
+      "path": "events-2026-09-25-16.jsonl",
+      "bytes": 567,
+      "rows": 1,
+      "sha256": "2acbeb6552b3f62ee6a3cbf528a4eef1a17883a97c239748abc61d2a9f21f156"
+    },
+    {
+      "path": "observations-2026-09-25-16.jsonl",
+      "bytes": 389,
+      "rows": 1,
+      "sha256": "7c35ad20f774d24d95e9a636342360be03c22e10f6855beaad7074a090880425"
+    }
+  ]
+}
