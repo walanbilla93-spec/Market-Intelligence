@@ -260,6 +260,11 @@ class Storage:
             row=self.db.execute("SELECT input_snapshot_json FROM briefings WHERE briefing_id=?",(briefing_id,)).fetchone()
         return json.loads(row[0]) if row else None
 
+    def briefing_trigger_reason(self, briefing_id: str) -> str | None:
+        with self._lock:
+            row=self.db.execute("SELECT trigger_reason FROM briefings WHERE briefing_id=?",(briefing_id,)).fetchone()
+        return str(row[0]) if row else None
+
     def mark_briefing_running(self, briefing_id: str, attempt_count: int) -> None:
         with self._lock:
             self.db.execute("UPDATE briefings SET status='RUNNING',attempt_count=?,updated_at_utc=? WHERE briefing_id=?",

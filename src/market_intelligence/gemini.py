@@ -15,7 +15,7 @@ from .storage import Storage
 from .util import canonical_json, iso_utc
 
 
-PROMPT_VERSION = "MARKET_BRIEFING_PROMPT_V2"
+PROMPT_VERSION = "MARKET_BRIEFING_PROMPT_V3"
 SCHEMA_VERSION = "MARKET_BRIEFING_V2"
 FIXED_MODEL = "gemini-3.8-flash"
 RETRYABLE_HTTP_CODES = {500, 502, 503, 504}
@@ -55,13 +55,17 @@ class GeminiObserver:
         requested_model = os.getenv("GEMINI_MODEL", FIXED_MODEL)
         self.model = FIXED_MODEL
         self.model_config_valid = requested_model == FIXED_MODEL
-        self.timeout = max(2.0, min(float(os.getenv("GEMINI_TIMEOUT_SECONDS", "12")), 30.0))
+        self.timeout = max(2.0, min(float(os.getenv("GEMINI_TIMEOUT_SECONDS", "30")), 30.0))
         self.total_timeout = max(self.timeout,
-                                 min(float(os.getenv("GEMINI_TOTAL_TIMEOUT_SECONDS", "20")), 45.0))
+                                 min(float(os.getenv("GEMINI_TOTAL_TIMEOUT_SECONDS", "45")), 45.0))
         self.threshold = max(1, min(int(os.getenv("GEMINI_FAILURE_THRESHOLD", "3")), 10))
         self.open_seconds = max(60, min(int(os.getenv("GEMINI_CIRCUIT_OPEN_SECONDS", "900")), 3600))
         self.max_attempts = max(1, min(int(os.getenv("GEMINI_MAX_ATTEMPTS", "2")), 2))
-        self.max_output_tokens = max(512, min(int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "2048")), 3072))
+        self.max_output_tokens = max(4096, min(int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "8192")), 16384))
+        self.routine_thinking_level = os.getenv("GEMINI_ROUTINE_THINKING_LEVEL", "medium").lower()
+        self.event_thinking_level = os.getenv("GEMINI_EVENT_THINKING_LEVEL", "high").lower()
+        self.thinking_config_valid = all(level in {"low", "medium", "high"} for level in
+                                         (self.routine_thinking_level, self.event_thinking_level))
         self.max_input_chars = max(8000, min(int(os.getenv("GEMINI_MAX_INPUT_CHARS", "24000")), 48000))
         self.max_request_bytes = max(20000, min(int(os.getenv("GEMINI_MAX_REQUEST_BYTES", "65536")), 100000))
         self.max_input_age = max(300, min(int(os.getenv("GEMINI_MAX_INPUT_AGE_SECONDS", "1200")), 7200))
@@ -93,9 +97,9 @@ class GeminiObserver:
         event_due = self.event_trigger and self.storage.has_meaningful_event_since(latest_created)
         if not (interval_due or event_due):
             return None
-        if self.storage.count_briefing_requests_since(iso_utc(now - timedelta(minutes=30))) >= 2:
+        if self.storage.count_briefing_requests_since(iso_utc(now - timedelta(minutes=30))) >= 1:
             self.storage.health("gemini_observer", "BUDGET_LIMIT", attempted, 0,
-                                "maximum 2 briefing records per 30 minutes")
+                                "maximum 1 briefing request per 30 minutes")
             return None
         snapshot = self.storage.build_briefing_snapshot(now)
         trigger = "VERIFIED_NEW_EVENT" if event_due else "SCHEDULED_INTERVAL"
@@ -121,6 +125,12 @@ class GeminiObserver:
                 SCHEMA_VERSION, "DISABLED_MODEL_MISMATCH", "MODEL_MISMATCH",
                 f"GEMINI_MODEL must be {FIXED_MODEL}")
             self.storage.health("gemini_observer", "DISABLED", attempted, 0, "fixed model mismatch")
+            return briefing_id
+        if not self.thinking_config_valid:
+            briefing_id = self.storage.create_briefing(snapshot, trigger, self.model, PROMPT_VERSION,
+                SCHEMA_VERSION, "DISABLED_THINKING_CONFIG", "THINKING_CONFIG",
+                "thinking level must be low, medium, or high")
+            self.storage.health("gemini_observer", "DISABLED", attempted, 0, "invalid thinking config")
             return briefing_id
         if not self.api_key:
             briefing_id = self.storage.create_briefing(snapshot, trigger, self.model, PROMPT_VERSION,
@@ -159,14 +169,19 @@ class GeminiObserver:
         snapshot = self.storage.briefing_input(briefing_id)
         if snapshot is None:
             return
-        result = await self.observe(snapshot, briefing_id)
+        trigger = self.storage.briefing_trigger_reason(briefing_id)
+        thinking_level = (self.event_thinking_level if trigger == "VERIFIED_NEW_EVENT"
+                          else self.routine_thinking_level)
+        result = await self.observe(snapshot, briefing_id, thinking_level)
         self.storage.complete_briefing(briefing_id, result)
         self.storage.health("gemini_observer", result["status"], iso_utc(),
                             int(result.get("latency_ms") or 0), result.get("error_detail"))
 
-    async def observe(self, payload: dict[str, Any], briefing_id: str = "direct") -> dict[str, Any]:
+    async def observe(self, payload: dict[str, Any], briefing_id: str = "direct",
+                      thinking_level: str | None = None) -> dict[str, Any]:
         loop = asyncio.get_running_loop()
         started = time.monotonic()
+        thinking_level = thinking_level or self.routine_thinking_level
         if loop.time() < self.circuit.open_until:
             return _failure("CIRCUIT_OPEN", "circuit breaker is open", started)
         deadline = loop.time() + self.total_timeout
@@ -183,17 +198,20 @@ class GeminiObserver:
                 self.storage.mark_briefing_running(briefing_id, attempt)
             request_timeout = min(self.timeout, remaining)
             try:
-                response = await asyncio.wait_for(asyncio.to_thread(self._request, payload, request_timeout),
-                                                  timeout=min(remaining, request_timeout + 0.5))
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(self._request, payload, request_timeout, thinking_level),
+                    timeout=min(remaining, request_timeout + 0.5))
                 self.circuit.failures = 0
                 diagnostics = dict(response.get("diagnostics") or {})
                 diagnostics["attempts"] = attempts
+                diagnostics["thinking_level"] = thinking_level
+                diagnostics["max_output_tokens"] = self.max_output_tokens
                 return {"status": "OK", "authoritative": False, "output": response["output"],
                         "usage": response.get("usage") or {}, "finish_reason": response.get("finish_reason"),
                         "diagnostics": diagnostics, "latency_ms": int((time.monotonic() - started) * 1000)}
             except asyncio.TimeoutError:
                 last_error = ObserverError("TIMEOUT", f"attempt deadline of {request_timeout:g}s exceeded",
-                                           diagnostics={"deadline_scope": "attempt"})
+                    diagnostics={"deadline_scope": "attempt", "retry_suppressed": "possible request still active"})
             except ObserverError as error:
                 last_error = error
             except Exception as error:
@@ -213,10 +231,13 @@ class GeminiObserver:
         assert last_error is not None
         diagnostics = dict(last_error.diagnostics)
         diagnostics["attempts"] = attempts
+        diagnostics["thinking_level"] = thinking_level
+        diagnostics["max_output_tokens"] = self.max_output_tokens
         return _failure(last_error.error_type, last_error.detail, started, usage=last_error.usage,
                         finish_reason=last_error.finish_reason, diagnostics=diagnostics)
 
-    def _request(self, payload: dict[str, Any], request_timeout: float | None = None) -> dict[str, Any]:
+    def _request(self, payload: dict[str, Any], request_timeout: float | None = None,
+                 thinking_level: str | None = None) -> dict[str, Any]:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
         prompt = {"prompt_version": PROMPT_VERSION,
           "task": "Produce one concise, non-authoritative market briefing as schema-valid JSON.",
@@ -227,9 +248,11 @@ class GeminiObserver:
             "Do not forecast prices, recommend trades, control trading, or propose rule learning.",
             "Stay within every schema length and item limit."],
           "required_output_schema": SCHEMA_VERSION, "input": payload}
+        thinking_level = thinking_level or self.routine_thinking_level
         body = json.dumps({"contents": [{"parts": [{"text": canonical_json(prompt)}]}],
           "generationConfig": {"temperature": 0, "candidateCount": 1,
             "maxOutputTokens": self.max_output_tokens,
+            "thinkingConfig": {"thinkingLevel": thinking_level},
             "responseFormat": {"text": {"mimeType": "APPLICATION_JSON", "schema": _response_schema()}}}},
           separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         if len(body) > self.max_request_bytes:
@@ -243,8 +266,8 @@ class GeminiObserver:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 raw = response.read(1_000_001)
         except urllib.error.HTTPError as error:
-            kind = "QUOTA_429" if error.code == 429 else f"API_HTTP_{error.code}"
-            raise ObserverError(kind, _http_error_detail(error), error.code in RETRYABLE_HTTP_CODES) from error
+            kind, detail = _classify_http_error(error)
+            raise ObserverError(kind, detail, error.code in RETRYABLE_HTTP_CODES) from error
         except urllib.error.URLError as error:
             if isinstance(error.reason, (TimeoutError, socket.timeout)):
                 raise ObserverError("TIMEOUT", "HTTP transport timed out", True) from error
@@ -334,18 +357,25 @@ def _safe_usage(value: Any) -> dict[str, int]:
             if key in USAGE_FIELDS and isinstance(item, int) and not isinstance(item, bool) and item >= 0}
 
 
-def _http_error_detail(error: urllib.error.HTTPError) -> str:
+def _classify_http_error(error: urllib.error.HTTPError) -> tuple[str, str]:
     raw = error.read(4096)
+    kind = "QUOTA_429" if error.code == 429 else f"API_HTTP_{error.code}"
     try:
         payload = json.loads(raw)
         item = payload.get("error") if isinstance(payload, dict) else None
         if isinstance(item, dict):
             status = str(item.get("status") or "")[:80]
             message = str(item.get("message") or "")[:180].replace("\n", " ")
-            return f"HTTP {error.code} {status}: {message}".strip()
+            detail_text = canonical_json(item.get("details") or [])[:600].lower()
+            billing_text = f"{status} {message} {detail_text}".lower()
+            if error.code == 403 and any(marker in billing_text for marker in
+                                         ("billing", "service_disabled", "service disabled",
+                                          "api has not been used", "has been disabled")):
+                kind = "BILLING_DISABLED"
+            return kind, f"HTTP {error.code} {status}: {message}".strip()
     except (UnicodeDecodeError, json.JSONDecodeError):
         pass
-    return f"HTTP {error.code} {error.reason}"[:300]
+    return kind, f"HTTP {error.code} {error.reason}"[:300]
 
 
 def _json_error_summary(error: Exception) -> str:
