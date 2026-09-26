@@ -110,7 +110,7 @@ class ServiceTests(unittest.TestCase):
         self._fresh_market();snapshot=self.store.build_briefing_snapshot()
         briefing_id=self.store.create_briefing(snapshot,"TEST",FIXED_MODEL,PROMPT_VERSION,SCHEMA_VERSION)
         observer=GeminiObserver(self.store,enabled=True)
-        observer._request=lambda payload,timeout=None:{"output":self._valid_output(),"usage":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15},"finish_reason":"STOP","diagnostics":{"response_bytes":100}}
+        observer._request=lambda payload,timeout=None,thinking_level=None:{"output":self._valid_output(),"usage":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15},"finish_reason":"STOP","diagnostics":{"response_bytes":100}}
         asyncio.run(observer._process(briefing_id))
         row=self.store.db.execute("SELECT status,total_tokens,authoritative,output_json FROM briefings WHERE briefing_id=?",(briefing_id,)).fetchone()
         self.assertEqual(row["status"],"OK");self.assertEqual(row["total_tokens"],15);self.assertEqual(row["authoritative"],0)
@@ -137,6 +137,8 @@ class ServiceTests(unittest.TestCase):
         self.assertNotIn("responseMimeType",captured["body"]["generationConfig"])
         self.assertNotIn("responseSchema",captured["body"]["generationConfig"])
         self.assertEqual(captured["body"]["generationConfig"]["candidateCount"],1)
+        self.assertEqual(captured["body"]["generationConfig"]["maxOutputTokens"],8192)
+        self.assertEqual(captured["body"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],"medium")
         self.assertEqual(schema["properties"]["facts"]["maxItems"],3)
 
     def test_gemini_http_429_is_classified(self) -> None:
@@ -146,40 +148,52 @@ class ServiceTests(unittest.TestCase):
             with self.assertRaises(ObserverError) as caught:observer._request({"x":1})
         self.assertEqual(caught.exception.error_type,"QUOTA_429");self.assertFalse(caught.exception.retryable)
 
+    def test_gemini_billing_disabled_is_classified(self) -> None:
+        observer=GeminiObserver(self.store,enabled=True);observer.api_key="secret-test-key"
+        body=b'{"error":{"code":403,"status":"PERMISSION_DENIED","message":"Billing is disabled for this project"}}'
+        error=urllib.error.HTTPError("https://example.test",403,"forbidden",{},io.BytesIO(body))
+        with patch("market_intelligence.gemini.urllib.request.urlopen",side_effect=error):
+            with self.assertRaises(ObserverError) as caught:observer._request({"x":1})
+        self.assertEqual(caught.exception.error_type,"BILLING_DISABLED")
+        self.assertFalse(caught.exception.retryable)
+
     def test_gemini_malformed_response(self) -> None:
         observer=GeminiObserver(self.store,enabled=True);observer.max_attempts=1
-        observer._request=lambda payload,timeout=None:(_ for _ in ()).throw(ObserverError("MALFORMED_RESPONSE","bad schema"))
+        observer._request=lambda payload,timeout=None,thinking_level=None:(_ for _ in ()).throw(ObserverError("MALFORMED_RESPONSE","bad schema"))
         result=asyncio.run(observer.observe({"x":1}));self.assertEqual(result["status"],"MALFORMED_RESPONSE")
 
     def test_gemini_quota_429_is_not_retried(self) -> None:
         observer=GeminiObserver(self.store,enabled=True);calls=[]
-        def quota(payload,timeout=None):calls.append(1);raise ObserverError("QUOTA_429","quota",False)
+        def quota(payload,timeout=None,thinking_level=None):calls.append(1);raise ObserverError("QUOTA_429","quota",False)
         observer._request=quota;result=asyncio.run(observer.observe({"x":1}))
         self.assertEqual(result["status"],"QUOTA_429");self.assertEqual(len(calls),1)
 
     def test_gemini_http_503_has_one_bounded_retry(self) -> None:
         observer=GeminiObserver(self.store,enabled=True);calls=[]
-        def unavailable(payload,timeout=None):calls.append(1);raise ObserverError("API_HTTP_503","high demand",True)
+        def unavailable(payload,timeout=None,thinking_level=None):calls.append(1);raise ObserverError("API_HTTP_503","high demand",True)
         observer._request=unavailable;result=asyncio.run(observer.observe({"x":1}))
         self.assertEqual(result["status"],"API_HTTP_503");self.assertEqual(len(calls),2)
 
     def test_gemini_transport_timeout_has_one_bounded_retry(self) -> None:
         observer=GeminiObserver(self.store,enabled=True);calls=[]
-        def timeout(payload,request_timeout=None):calls.append(1);raise ObserverError("TIMEOUT","transport timeout",True)
+        def timeout(payload,request_timeout=None,thinking_level=None):calls.append(1);raise ObserverError("TIMEOUT","transport timeout",True)
         observer._request=timeout;result=asyncio.run(observer.observe({"x":1}))
         self.assertEqual(result["status"],"TIMEOUT");self.assertEqual(len(calls),2)
 
     def test_gemini_hard_timeout(self) -> None:
-        observer=GeminiObserver(self.store,enabled=True);observer.timeout=0.01;observer.max_attempts=1
+        observer=GeminiObserver(self.store,enabled=True);observer.timeout=0.01;observer.max_attempts=2
         observer.total_timeout=0.03
-        def slow(payload,timeout=None):time.sleep(0.05);return {"output":self._valid_output(),"usage":{},"diagnostics":{}}
+        calls=[]
+        def slow(payload,timeout=None,thinking_level=None):calls.append(1);time.sleep(0.05);return {"output":self._valid_output(),"usage":{},"diagnostics":{}}
         observer._request=slow;result=asyncio.run(observer.observe({"x":1}))
         self.assertEqual(result["status"],"TIMEOUT")
         self.assertLess(result["latency_ms"],100)
+        self.assertEqual(len(calls),1)
+        self.assertEqual(result["diagnostics"]["retry_suppressed"],"possible request still active")
 
     def test_gemini_unavailable_network_and_circuit_breaker(self) -> None:
         observer=GeminiObserver(self.store,enabled=True);observer.max_attempts=1;observer.threshold=1
-        observer._request=lambda payload,timeout=None:(_ for _ in ()).throw(ObserverError("NETWORK_ERROR","offline",True))
+        observer._request=lambda payload,timeout=None,thinking_level=None:(_ for _ in ()).throw(ObserverError("NETWORK_ERROR","offline",True))
         first=asyncio.run(observer.observe({"x":1}));second=asyncio.run(observer.observe({"x":1}))
         self.assertEqual(first["status"],"NETWORK_ERROR");self.assertEqual(second["status"],"CIRCUIT_OPEN")
 
@@ -200,11 +214,50 @@ class ServiceTests(unittest.TestCase):
         self.assertNotIn("secret fragment",json.dumps(error.diagnostics))
         self.assertNotIn("secret fragment",error.detail)
 
+    def test_gemini_success_with_substantial_thinking_records_safe_diagnostics(self) -> None:
+        observer=GeminiObserver(self.store,enabled=True)
+        observer._request=lambda payload,timeout=None,thinking_level=None:{
+          "output":self._valid_output(),
+          "usage":{"promptTokenCount":2572,"thoughtsTokenCount":6000,
+                   "candidatesTokenCount":900,"totalTokenCount":9472},
+          "finish_reason":"STOP","diagnostics":{"candidate_text_chars":2400}}
+        result=asyncio.run(observer.observe({"x":1},thinking_level="high"))
+        self.assertEqual(result["status"],"OK")
+        self.assertEqual(result["usage"]["thoughtsTokenCount"],6000)
+        self.assertEqual(result["diagnostics"]["thinking_level"],"high")
+        self.assertEqual(result["diagnostics"]["max_output_tokens"],8192)
+
+    def test_event_uses_high_thinking_and_routine_uses_medium(self) -> None:
+        self._fresh_market();snapshot=self.store.build_briefing_snapshot();seen=[]
+        observer=GeminiObserver(self.store,enabled=True)
+        observer._request=lambda payload,timeout=None,thinking_level=None:(seen.append(thinking_level) or {
+          "output":self._valid_output(),"usage":{},"finish_reason":"STOP","diagnostics":{}})
+        event_id=self.store.create_briefing(snapshot,"VERIFIED_NEW_EVENT",FIXED_MODEL,PROMPT_VERSION,SCHEMA_VERSION)
+        asyncio.run(observer._process(event_id));self.assertEqual(seen,["high"])
+        later=dict(snapshot);later["captured_at_utc"]="2026-09-27T01:00:00Z";later["watermark_utc"]="2026-09-27T01:00:00Z"
+        routine_id=self.store.create_briefing(later,"SCHEDULED_INTERVAL",FIXED_MODEL,PROMPT_VERSION,SCHEMA_VERSION)
+        asyncio.run(observer._process(routine_id));self.assertEqual(seen,["high","medium"])
+
+    def test_invalid_thinking_level_fails_closed(self) -> None:
+        self._fresh_market()
+        with patch.dict(os.environ,{"GEMINI_ROUTINE_THINKING_LEVEL":"maximum"},clear=False):
+            observer=GeminiObserver(self.store,enabled=True);observer.api_key="not-used"
+            briefing_id=observer.schedule_after_collection()
+        row=self.store.db.execute("SELECT status,error_type FROM briefings WHERE briefing_id=?",(briefing_id,)).fetchone()
+        self.assertEqual(tuple(row),("DISABLED_THINKING_CONFIG","THINKING_CONFIG"))
+        self.assertTrue(observer.queue.empty())
+
+    def test_only_one_briefing_request_per_thirty_minutes(self) -> None:
+        self._fresh_market();observer=GeminiObserver(self.store,enabled=True);observer.api_key="not-used"
+        self.assertIsNotNone(observer.schedule_after_collection())
+        self.assertIsNone(observer.schedule_after_collection())
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM briefings").fetchone()[0],1)
+
     def test_gemini_malformed_candidate_preserves_safe_diagnostics_in_storage(self) -> None:
         self._fresh_market();snapshot=self.store.build_briefing_snapshot()
         briefing_id=self.store.create_briefing(snapshot,"TEST",FIXED_MODEL,PROMPT_VERSION,SCHEMA_VERSION)
         observer=GeminiObserver(self.store,enabled=True);observer.max_attempts=1
-        observer._request=lambda payload,timeout=None:(_ for _ in ()).throw(ObserverError(
+        observer._request=lambda payload,timeout=None,thinking_level=None:(_ for _ in ()).throw(ObserverError(
           "MALFORMED_RESPONSE","candidate JSON invalid at line 3 column 14",
           usage={"promptTokenCount":90,"candidatesTokenCount":1200,"totalTokenCount":1290},finish_reason="STOP",
           diagnostics={"candidate_text_chars":4800,"candidate_json_error":"Unterminated string at line 3 column 14 char 66"}))
