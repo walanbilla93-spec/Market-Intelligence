@@ -110,7 +110,7 @@ class ServiceTests(unittest.TestCase):
         self._fresh_market();snapshot=self.store.build_briefing_snapshot()
         briefing_id=self.store.create_briefing(snapshot,"TEST",FIXED_MODEL,PROMPT_VERSION,SCHEMA_VERSION)
         observer=GeminiObserver(self.store,enabled=True)
-        observer._request=lambda payload:{"output":self._valid_output(),"usage":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}
+        observer._request=lambda payload,timeout=None:{"output":self._valid_output(),"usage":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15},"finish_reason":"STOP","diagnostics":{"response_bytes":100}}
         asyncio.run(observer._process(briefing_id))
         row=self.store.db.execute("SELECT status,total_tokens,authoritative,output_json FROM briefings WHERE briefing_id=?",(briefing_id,)).fetchone()
         self.assertEqual(row["status"],"OK");self.assertEqual(row["total_tokens"],15);self.assertEqual(row["authoritative"],0)
@@ -133,36 +133,92 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(captured["headers"]["X-goog-api-key"],"secret-test-key")
         schema=captured["body"]["generationConfig"]["responseFormat"]["text"]["schema"]
         self.assertEqual(schema["type"],"object")
+        self.assertEqual(captured["body"]["generationConfig"]["responseFormat"]["text"]["mimeType"],"APPLICATION_JSON")
+        self.assertNotIn("responseMimeType",captured["body"]["generationConfig"])
+        self.assertNotIn("responseSchema",captured["body"]["generationConfig"])
+        self.assertEqual(captured["body"]["generationConfig"]["candidateCount"],1)
+        self.assertEqual(schema["properties"]["facts"]["maxItems"],3)
 
     def test_gemini_http_429_is_classified(self) -> None:
         observer=GeminiObserver(self.store,enabled=True);observer.api_key="secret-test-key"
         error=urllib.error.HTTPError("https://example.test",429,"quota",{},io.BytesIO(b'{"error":"quota"}'))
         with patch("market_intelligence.gemini.urllib.request.urlopen",side_effect=error):
             with self.assertRaises(ObserverError) as caught:observer._request({"x":1})
-        self.assertEqual(caught.exception.error_type,"QUOTA_429");self.assertTrue(caught.exception.retryable)
+        self.assertEqual(caught.exception.error_type,"QUOTA_429");self.assertFalse(caught.exception.retryable)
 
     def test_gemini_malformed_response(self) -> None:
         observer=GeminiObserver(self.store,enabled=True);observer.max_attempts=1
-        observer._request=lambda payload:(_ for _ in ()).throw(ObserverError("MALFORMED_RESPONSE","bad schema"))
+        observer._request=lambda payload,timeout=None:(_ for _ in ()).throw(ObserverError("MALFORMED_RESPONSE","bad schema"))
         result=asyncio.run(observer.observe({"x":1}));self.assertEqual(result["status"],"MALFORMED_RESPONSE")
 
-    def test_gemini_quota_429_is_bounded_retry(self) -> None:
+    def test_gemini_quota_429_is_not_retried(self) -> None:
         observer=GeminiObserver(self.store,enabled=True);calls=[]
-        def quota(payload):calls.append(1);raise ObserverError("QUOTA_429","quota",True)
+        def quota(payload,timeout=None):calls.append(1);raise ObserverError("QUOTA_429","quota",False)
         observer._request=quota;result=asyncio.run(observer.observe({"x":1}))
-        self.assertEqual(result["status"],"QUOTA_429");self.assertEqual(len(calls),2)
+        self.assertEqual(result["status"],"QUOTA_429");self.assertEqual(len(calls),1)
+
+    def test_gemini_http_503_has_one_bounded_retry(self) -> None:
+        observer=GeminiObserver(self.store,enabled=True);calls=[]
+        def unavailable(payload,timeout=None):calls.append(1);raise ObserverError("API_HTTP_503","high demand",True)
+        observer._request=unavailable;result=asyncio.run(observer.observe({"x":1}))
+        self.assertEqual(result["status"],"API_HTTP_503");self.assertEqual(len(calls),2)
+
+    def test_gemini_transport_timeout_has_one_bounded_retry(self) -> None:
+        observer=GeminiObserver(self.store,enabled=True);calls=[]
+        def timeout(payload,request_timeout=None):calls.append(1);raise ObserverError("TIMEOUT","transport timeout",True)
+        observer._request=timeout;result=asyncio.run(observer.observe({"x":1}))
+        self.assertEqual(result["status"],"TIMEOUT");self.assertEqual(len(calls),2)
 
     def test_gemini_hard_timeout(self) -> None:
         observer=GeminiObserver(self.store,enabled=True);observer.timeout=0.01;observer.max_attempts=1
-        def slow(payload):time.sleep(0.05);return {"output":self._valid_output(),"usage":{}}
+        observer.total_timeout=0.03
+        def slow(payload,timeout=None):time.sleep(0.05);return {"output":self._valid_output(),"usage":{},"diagnostics":{}}
         observer._request=slow;result=asyncio.run(observer.observe({"x":1}))
         self.assertEqual(result["status"],"TIMEOUT")
+        self.assertLess(result["latency_ms"],100)
 
     def test_gemini_unavailable_network_and_circuit_breaker(self) -> None:
         observer=GeminiObserver(self.store,enabled=True);observer.max_attempts=1;observer.threshold=1
-        observer._request=lambda payload:(_ for _ in ()).throw(ObserverError("NETWORK_ERROR","offline",True))
+        observer._request=lambda payload,timeout=None:(_ for _ in ()).throw(ObserverError("NETWORK_ERROR","offline",True))
         first=asyncio.run(observer.observe({"x":1}));second=asyncio.run(observer.observe({"x":1}))
         self.assertEqual(first["status"],"NETWORK_ERROR");self.assertEqual(second["status"],"CIRCUIT_OPEN")
+
+    def test_gemini_truncated_json_captures_finish_reason_and_usage_without_raw_text(self) -> None:
+        observer=GeminiObserver(self.store,enabled=True);observer.api_key="secret-test-key"
+        raw={"candidates":[{"finishReason":"MAX_TOKENS","content":{"parts":[{"text":"{\"summary\":\"secret fragment"}]}}],
+          "usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":2048,"thoughtsTokenCount":7,"totalTokenCount":2155}}
+        class FakeResponse:
+            def __enter__(self):return self
+            def __exit__(self,*args):return False
+            def read(self,limit):return json.dumps(raw).encode()
+        with patch("market_intelligence.gemini.urllib.request.urlopen",return_value=FakeResponse()):
+            with self.assertRaises(ObserverError) as caught:observer._request({"x":1})
+        error=caught.exception
+        self.assertEqual(error.error_type,"OUTPUT_TRUNCATED");self.assertEqual(error.finish_reason,"MAX_TOKENS")
+        self.assertEqual(error.usage["candidatesTokenCount"],2048)
+        self.assertIn("candidate_json_error",error.diagnostics)
+        self.assertNotIn("secret fragment",json.dumps(error.diagnostics))
+        self.assertNotIn("secret fragment",error.detail)
+
+    def test_gemini_malformed_candidate_preserves_safe_diagnostics_in_storage(self) -> None:
+        self._fresh_market();snapshot=self.store.build_briefing_snapshot()
+        briefing_id=self.store.create_briefing(snapshot,"TEST",FIXED_MODEL,PROMPT_VERSION,SCHEMA_VERSION)
+        observer=GeminiObserver(self.store,enabled=True);observer.max_attempts=1
+        observer._request=lambda payload,timeout=None:(_ for _ in ()).throw(ObserverError(
+          "MALFORMED_RESPONSE","candidate JSON invalid at line 3 column 14",
+          usage={"promptTokenCount":90,"candidatesTokenCount":1200,"totalTokenCount":1290},finish_reason="STOP",
+          diagnostics={"candidate_text_chars":4800,"candidate_json_error":"Unterminated string at line 3 column 14 char 66"}))
+        asyncio.run(observer._process(briefing_id))
+        self.store.close();self.store=Storage(self.data,"boot-diagnostics-restart",ROOT/"migrations")
+        item=self.store.list_briefings(1)[0]
+        self.assertEqual(item["finish_reason"],"STOP");self.assertEqual(item["usage"]["totalTokenCount"],1290)
+        self.assertEqual(item["response_diagnostics"]["candidate_text_chars"],4800)
+        self.assertIsNone(item["output"])
+
+    def test_gemini_encoded_request_is_bounded(self) -> None:
+        observer=GeminiObserver(self.store,enabled=True);observer.api_key="secret-test-key";observer.max_request_bytes=20000
+        with self.assertRaises(ObserverError) as caught:observer._request({"x":"z"*30000})
+        self.assertEqual(caught.exception.error_type,"REQUEST_TOO_LARGE")
 
     def test_stale_input_abstains_without_request(self) -> None:
         observer=GeminiObserver(self.store,enabled=True);observer.api_key="not-used"
