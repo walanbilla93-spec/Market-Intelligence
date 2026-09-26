@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import json
 import os
 import time
 import uuid
@@ -10,6 +12,7 @@ from pathlib import Path
 from .adapters import BeaScheduleAdapter, BlsCalendarAdapter, BybitContextAdapter, FedFomcAdapter, FredAdapter, RssAdapter
 from .config import Config
 from .exporter import build_manifest
+from .gemini import GeminiObserver
 from .http import BoundedHttpClient
 from .linkage import import_candidates
 from .models import Event, Observation
@@ -55,22 +58,32 @@ async def collect_once(config: Config,storage: Storage) -> dict[str,int]:
 
 
 async def run_forever(config: Config,storage: Storage) -> None:
-    while True:
-        await collect_once(config,storage)
-        await asyncio.sleep(config.poll_seconds)
+    observer=GeminiObserver(storage,config.gemini_enabled,config.gemini_interval_seconds,config.gemini_event_trigger)
+    worker=asyncio.create_task(observer.run(),name="gemini-shadow-observer")
+    try:
+        while True:
+            await collect_once(config,storage)
+            observer.schedule_after_collection()
+            await asyncio.sleep(config.poll_seconds)
+    finally:
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):await worker
 
 
 def main() -> None:
     parser=argparse.ArgumentParser(description="Independent New Orayan market intelligence service")
-    parser.add_argument("command",choices=["run","once","migrate","export","import-candidates"])
-    parser.add_argument("path",nargs="?");args=parser.parse_args();config=Config.load();boot_id=str(uuid.uuid4())
-    storage=Storage(config.data_dir,boot_id,migrations_dir())
+    parser.add_argument("command",choices=["run","once","migrate","export","import-candidates","status","briefings"])
+    parser.add_argument("path",nargs="?");parser.add_argument("--limit",type=int,default=5)
+    args=parser.parse_args();config=Config.load();boot_id=str(uuid.uuid4())
+    storage=Storage(config.data_dir,boot_id,migrations_dir(),read_only=args.command in {"status","briefings"})
     try:
         if args.command=="migrate":print({"ok":True,"database":str(storage.db_path)})
         elif args.command=="export":print(build_manifest(storage.export_dir))
         elif args.command=="import-candidates":
             if not args.path:parser.error("import-candidates requires a JSONL path")
             print(import_candidates(Path(args.path),storage))
+        elif args.command=="status":print(json.dumps(storage.service_status(),indent=2,sort_keys=True))
+        elif args.command=="briefings":print(json.dumps(storage.list_briefings(args.limit),indent=2,sort_keys=True))
         elif args.command=="once":print(asyncio.run(collect_once(config,storage)))
         else:asyncio.run(run_forever(config,storage))
     finally:storage.close()
