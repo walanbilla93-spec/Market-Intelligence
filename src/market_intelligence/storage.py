@@ -269,6 +269,7 @@ class Storage:
         now=iso_utc();output=result.get("output");output_json=canonical_json(output) if output is not None else None
         content_hash=sha256_text(output_json) if output_json else None
         usage=result.get("usage") or {}
+        diagnostics=result.get("diagnostics") or {}
         with self._lock:
             row=self.db.execute("SELECT trigger_reason,prompt_version,schema_version,model,input_snapshot_hash,input_watermark_utc,first_seen_at_utc,requested_at_utc,attempt_count FROM briefings WHERE briefing_id=?",(briefing_id,)).fetchone()
             if row is None:return
@@ -278,6 +279,12 @@ class Storage:
               (result["status"],now,now,result.get("latency_ms"),usage.get("promptTokenCount"),
                usage.get("candidatesTokenCount"),usage.get("totalTokenCount"),None,result.get("error_type"),
                (result.get("error_detail") or "")[:500] or None,output_json,content_hash,now,briefing_id))
+            self.db.execute("""INSERT INTO briefing_diagnostics
+              (briefing_id,finish_reason,usage_json,diagnostics_json,updated_at_utc)
+              VALUES (?,?,?,?,?) ON CONFLICT(briefing_id) DO UPDATE SET
+              finish_reason=excluded.finish_reason,usage_json=excluded.usage_json,
+              diagnostics_json=excluded.diagnostics_json,updated_at_utc=excluded.updated_at_utc""",
+              (briefing_id,result.get("finish_reason"),canonical_json(usage),canonical_json(diagnostics),now))
             self.db.commit()
             self._append("briefings",{"briefing_id":briefing_id,"status":result["status"],"authoritative":False,
               "trigger_reason":row["trigger_reason"],"prompt_version":row["prompt_version"],
@@ -286,6 +293,7 @@ class Storage:
               "first_seen_at_utc":row["first_seen_at_utc"],"requested_at_utc":row["requested_at_utc"],
               "completed_at_utc":now,"available_to_system_at_utc":now,"latency_ms":result.get("latency_ms"),
               "usage":usage,"estimated_cost_usd":None,"attempt_count":row["attempt_count"],
+              "finish_reason":result.get("finish_reason"),"response_diagnostics":diagnostics,
               "error_type":result.get("error_type"),"error_detail":result.get("error_detail"),
               "content_hash":content_hash,"output":output},now)
 
@@ -303,13 +311,18 @@ class Storage:
 
     def list_briefings(self, limit: int = 5) -> list[dict[str, Any]]:
         with self._lock:
-            rows=self.db.execute("""SELECT briefing_id,status,trigger_reason,model,prompt_version,
-              schema_version,input_watermark_utc,requested_at_utc,available_to_system_at_utc,
-              latency_ms,input_tokens,output_tokens,total_tokens,error_type,error_detail,output_json
-              FROM briefings ORDER BY created_at_utc DESC LIMIT ?""",(max(1,min(limit,50)),)).fetchall()
+            rows=self.db.execute("""SELECT b.briefing_id,b.status,b.trigger_reason,b.model,b.prompt_version,
+              b.schema_version,b.input_watermark_utc,b.requested_at_utc,b.available_to_system_at_utc,
+              b.latency_ms,b.input_tokens,b.output_tokens,b.total_tokens,b.error_type,b.error_detail,b.output_json,
+              d.finish_reason,d.usage_json,d.diagnostics_json
+              FROM briefings b LEFT JOIN briefing_diagnostics d ON d.briefing_id=b.briefing_id
+              ORDER BY b.created_at_utc DESC LIMIT ?""",(max(1,min(limit,50)),)).fetchall()
         out=[]
         for row in rows:
-            item=dict(row);raw=item.pop("output_json");item["output"]=json.loads(raw) if raw else None;out.append(item)
+            item=dict(row);raw=item.pop("output_json");usage=item.pop("usage_json")
+            diagnostics=item.pop("diagnostics_json");item["output"]=json.loads(raw) if raw else None
+            item["usage"]=json.loads(usage) if usage else {};item["response_diagnostics"]=json.loads(diagnostics) if diagnostics else {}
+            out.append(item)
         return out
 
 
