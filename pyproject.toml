@@ -1,6 +1,6 @@
 [project]
 name = "new-orayan-market-intelligence"
-version = "0.1.0"
+version = "0.2.0"
 description = "Independent, failure-tolerant market context collector for offline New Orayan research"
 requires-python = ">=3.11"
 dependencies = []

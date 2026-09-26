@@ -11,6 +11,14 @@ An independent, observation-only service for one spare 512 MB instance. It is no
 - Optional trusted RSS sources for verified exchange incidents, maintenance, listings, protocol upgrades, or other unscheduled events. Only configured publishers are treated as trusted. Token-unlock sources are intentionally not preconfigured because licensing, quotas, and timestamp semantics vary; add one only after reviewing those terms.
 - Optional Gemini observer. It is bounded, deadline-limited, circuit-broken, JSON-only, and always saved as `authoritative=false`. A Gemini Pro web subscription is not assumed to provide API access.
 
+## Phase 1 shadow briefings
+
+Gemini remains off by default (`MI_GEMINI_ENABLED=false`) and therefore costs nothing. When explicitly enabled, the existing observer runs only inside this service after a collection cycle. It creates at most two briefing records per 30 minutes, uses a queue of at most two items, has a hard request deadline and at most one retry, and opens a circuit breaker after repeated failures. It never imports trading code, credentials, positions, signals, or orders.
+
+Each request uses the fixed stable `gemini-3.8-flash` model, prompt `MARKET_BRIEFING_PROMPT_V1`, and validated JSON schema `MARKET_BRIEFING_V1`. Inputs contain timestamped official calendar rows, configured verified news, source health, and the latest Bybit breadth/BTC/ETH observations. Missing or stale core observations cause a local abstention without an API request. FOMC meeting dates may be official while decision/press clock times remain explicitly labelled assumptions.
+
+Briefing requests, completions, errors, prompt/model/schema versions, input snapshots and watermarks, latency, token usage when returned, and availability timestamps are stored in the same SQLite database and hourly `briefings-*.jsonl` export. API, quota, timeout, malformed-response, stale-input, disabled, and circuit states are also visible in `source_health`. No briefing is authoritative, connected to New Orayan, or used for automatic rule learning.
+
 The service does not claim complete market-wide liquidation history. Public Bybit ticker context is included; a liquidation-shock adapter should be added only from a licensed, verifiable feed that provides receipt timestamps. Missing data remains `NOT_AVAILABLE` rather than zero.
 
 ## Storage and memory safety
@@ -35,7 +43,16 @@ Never substitute publisher time for system availability in backtests.
 5. Test one collection cycle with `orayan-market-intel once`.
 6. Run continuously with `orayan-market-intel run`.
 
+Read-only diagnostics:
+
+```text
+orayan-market-intel status
+orayan-market-intel briefings --limit 5
+```
+
 For a container, mount a persistent volume at `/data`, set `MI_DATA_DIR=/data`, and build the included Dockerfile. This package has not been deployed or started on Northflank.
+
+For Northflank Phase 1 setup, see `docs/PHASE1_GEMINI.md`. Keep the included Dockerfile command unchanged and never put a Gemini key in source control, a config file, or chat.
 
 ## Offline shadow linkage
 
@@ -58,5 +75,5 @@ The importer accepts only `candidate_birth` rows and deduplicates by `candidate_
 
 ## Tests
 
-Run `python -m unittest discover -s tests -v`. Tests cover schedule revisions, no-lookahead availability, restart dedupe, one-way candidate import, JSONL manifests/hashes, BLS timezone conversion, RSS causality, and disabled/bounded Gemini behavior.
+Run `python -m unittest discover -s tests -v`. Tests cover schedule revisions, no-lookahead availability, restart dedupe, one-way candidate import, JSONL manifests/hashes, BLS timezone conversion, RSS causality, and the disabled/no-key/success/malformed/quota/timeout/stale/network/restart/bounded Gemini paths without paid API requests.
 
