@@ -167,7 +167,7 @@ class GeminiObserver:
         body=json.dumps({
           "contents":[{"parts":[{"text":canonical_json(prompt)}]}],
           "generationConfig":{"temperature":0,"maxOutputTokens":self.max_output_tokens,
-            "responseFormat":{"text":{"mimeType":"application/json","schema":_response_schema()}}},
+            "responseFormat":{"text":{"mimeType":"APPLICATION_JSON","schema":_response_schema()}}},
         }).encode("utf-8")
         request=urllib.request.Request(url,data=body,headers={"Content-Type":"application/json",
           "x-goog-api-key":self.api_key},method="POST")
