@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import tempfile
+import time
+import urllib.error
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from market_intelligence.exporter import build_manifest
-from market_intelligence.gemini import GeminiObserver
+from market_intelligence.gemini import GeminiObserver, ObserverError, PROMPT_VERSION, SCHEMA_VERSION, FIXED_MODEL
 from market_intelligence.linkage import import_candidates
 from market_intelligence.models import Event, Observation
 from market_intelligence.storage import Storage
@@ -37,6 +41,10 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(event["scheduled_at_utc"],"2026-10-02T12:30:00Z")
         revisions=self.store.db.execute("SELECT count(*) FROM schedule_revisions WHERE event_id=?",(event_id,)).fetchone()[0]
         self.assertEqual(revisions,2)
+        self.store.upsert_event(Event(scheduled_at_utc="2026-10-02T12:30:00Z",**{**base,
+          "observed_at_utc":"2026-09-27T12:00:00Z","available_to_system_at_utc":"2026-09-27T12:00:00Z"}))
+        revisions=self.store.db.execute("SELECT count(*) FROM schedule_revisions WHERE event_id=?",(event_id,)).fetchone()[0]
+        self.assertEqual(revisions,2)
 
     def test_restart_dedupe(self) -> None:
         event=Event(source="test",event_type="NEWS",title="Same",publisher="Official",source_url="https://example.test/a",
@@ -62,14 +70,125 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(import_candidates(source,self.store)["inserted"],1)
         self.assertEqual(import_candidates(source,self.store)["inserted"],0)
 
-    def test_gemini_queue_is_bounded_and_disabled_without_key(self) -> None:
-        old=os.environ.pop("GEMINI_API_KEY",None)
+    def _fresh_market(self) -> None:
+        now=iso_utc()
+        rows=[
+          ("linear_breadth",None,12.0,"percent_net_up_minus_down"),
+          ("funding_rate","BTCUSDT",0.0001,"ratio"),("open_interest","BTCUSDT",100.0,"contracts"),
+          ("mark_index_basis","BTCUSDT",0.01,"percent"),("return_24h","BTCUSDT",0.02,"ratio"),
+          ("funding_rate","ETHUSDT",0.0002,"ratio"),("open_interest","ETHUSDT",200.0,"contracts"),
+          ("mark_index_basis","ETHUSDT",0.02,"percent"),("return_24h","ETHUSDT",0.03,"ratio"),
+          ("eth_btc_relative_price","ETH/BTC",0.03,"ratio"),
+        ]
+        for metric,instrument,value,unit in rows:
+            self.store.add_observation(Observation(source="bybit_context",metric=metric,instrument=instrument,
+              value_num=value,unit=unit,observed_at_utc=now,available_to_system_at_utc=now,
+              source_url="https://api.bybit.test"))
+
+    def _valid_output(self) -> dict:
+        return {"briefing_schema_version":SCHEMA_VERSION,"summary":"Shadow briefing","abstain":False,
+          "trading_authority":"NONE","facts":[],"interpretations":[],"upcoming_verified_events":[],
+          "market_stress_risk_flags":[],"stale_or_missing_fields":[],"uncertainties":[]}
+
+    def test_gemini_disabled_default_persists_source_health(self) -> None:
+        observer=GeminiObserver(self.store,enabled=False)
+        self.assertIsNone(observer.schedule_after_collection())
+        row=self.store.db.execute("SELECT status FROM source_health WHERE source='gemini_observer'").fetchone()
+        self.assertEqual(row[0],"DISABLED")
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM briefings").fetchone()[0],0)
+
+    def test_gemini_enabled_without_key_is_durable_and_sends_nothing(self) -> None:
+        self._fresh_market();old=os.environ.pop("GEMINI_API_KEY",None)
         try:
-            observer=GeminiObserver();self.assertFalse(observer.submit({"x":1}))
-            result=asyncio.run(observer.observe({"x":1}))
-            self.assertFalse(result["authoritative"])
+            observer=GeminiObserver(self.store,enabled=True);briefing_id=observer.schedule_after_collection()
+            row=self.store.db.execute("SELECT status,error_type FROM briefings WHERE briefing_id=?",(briefing_id,)).fetchone()
+            self.assertEqual(tuple(row),("DISABLED_NO_KEY","NO_API_KEY"));self.assertTrue(observer.queue.empty())
         finally:
             if old is not None:os.environ["GEMINI_API_KEY"]=old
+
+    def test_gemini_success_is_validated_and_persisted(self) -> None:
+        self._fresh_market();snapshot=self.store.build_briefing_snapshot()
+        briefing_id=self.store.create_briefing(snapshot,"TEST",FIXED_MODEL,PROMPT_VERSION,SCHEMA_VERSION)
+        observer=GeminiObserver(self.store,enabled=True)
+        observer._request=lambda payload:{"output":self._valid_output(),"usage":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}
+        asyncio.run(observer._process(briefing_id))
+        row=self.store.db.execute("SELECT status,total_tokens,authoritative,output_json FROM briefings WHERE briefing_id=?",(briefing_id,)).fetchone()
+        self.assertEqual(row["status"],"OK");self.assertEqual(row["total_tokens"],15);self.assertEqual(row["authoritative"],0)
+        self.assertEqual(json.loads(row["output_json"])["trading_authority"],"NONE")
+
+    def test_gemini_rest_shape_and_key_header(self) -> None:
+        output=self._valid_output();captured={}
+        class FakeResponse:
+            def __enter__(self):return self
+            def __exit__(self,*args):return False
+            def read(self,limit):
+                return json.dumps({"candidates":[{"content":{"parts":[{"text":json.dumps(output)}]}}]}).encode()
+        def fake_urlopen(request,timeout):
+            captured["url"]=request.full_url;captured["headers"]=dict(request.header_items())
+            captured["body"]=json.loads(request.data);return FakeResponse()
+        observer=GeminiObserver(self.store,enabled=True);observer.api_key="secret-test-key"
+        with patch("market_intelligence.gemini.urllib.request.urlopen",fake_urlopen):result=observer._request({"x":1})
+        self.assertEqual(result["output"]["trading_authority"],"NONE")
+        self.assertNotIn("secret-test-key",captured["url"])
+        self.assertEqual(captured["headers"]["X-goog-api-key"],"secret-test-key")
+        schema=captured["body"]["generationConfig"]["responseFormat"]["text"]["schema"]
+        self.assertEqual(schema["type"],"object")
+
+    def test_gemini_http_429_is_classified(self) -> None:
+        observer=GeminiObserver(self.store,enabled=True);observer.api_key="secret-test-key"
+        error=urllib.error.HTTPError("https://example.test",429,"quota",{},io.BytesIO(b'{"error":"quota"}'))
+        with patch("market_intelligence.gemini.urllib.request.urlopen",side_effect=error):
+            with self.assertRaises(ObserverError) as caught:observer._request({"x":1})
+        self.assertEqual(caught.exception.error_type,"QUOTA_429");self.assertTrue(caught.exception.retryable)
+
+    def test_gemini_malformed_response(self) -> None:
+        observer=GeminiObserver(self.store,enabled=True);observer.max_attempts=1
+        observer._request=lambda payload:(_ for _ in ()).throw(ObserverError("MALFORMED_RESPONSE","bad schema"))
+        result=asyncio.run(observer.observe({"x":1}));self.assertEqual(result["status"],"MALFORMED_RESPONSE")
+
+    def test_gemini_quota_429_is_bounded_retry(self) -> None:
+        observer=GeminiObserver(self.store,enabled=True);calls=[]
+        def quota(payload):calls.append(1);raise ObserverError("QUOTA_429","quota",True)
+        observer._request=quota;result=asyncio.run(observer.observe({"x":1}))
+        self.assertEqual(result["status"],"QUOTA_429");self.assertEqual(len(calls),2)
+
+    def test_gemini_hard_timeout(self) -> None:
+        observer=GeminiObserver(self.store,enabled=True);observer.timeout=0.01;observer.max_attempts=1
+        def slow(payload):time.sleep(0.05);return {"output":self._valid_output(),"usage":{}}
+        observer._request=slow;result=asyncio.run(observer.observe({"x":1}))
+        self.assertEqual(result["status"],"TIMEOUT")
+
+    def test_gemini_unavailable_network_and_circuit_breaker(self) -> None:
+        observer=GeminiObserver(self.store,enabled=True);observer.max_attempts=1;observer.threshold=1
+        observer._request=lambda payload:(_ for _ in ()).throw(ObserverError("NETWORK_ERROR","offline",True))
+        first=asyncio.run(observer.observe({"x":1}));second=asyncio.run(observer.observe({"x":1}))
+        self.assertEqual(first["status"],"NETWORK_ERROR");self.assertEqual(second["status"],"CIRCUIT_OPEN")
+
+    def test_stale_input_abstains_without_request(self) -> None:
+        observer=GeminiObserver(self.store,enabled=True);observer.api_key="not-used"
+        briefing_id=observer.schedule_after_collection()
+        row=self.store.db.execute("SELECT status FROM briefings WHERE briefing_id=?",(briefing_id,)).fetchone()
+        self.assertEqual(row[0],"ABSTAIN_STALE_INPUT");self.assertTrue(observer.queue.empty())
+
+    def test_restart_idempotency_and_queue_bound(self) -> None:
+        self._fresh_market();snapshot=self.store.build_briefing_snapshot()
+        first=self.store.create_briefing(snapshot,"TEST",FIXED_MODEL,PROMPT_VERSION,SCHEMA_VERSION)
+        second=self.store.create_briefing(snapshot,"TEST",FIXED_MODEL,PROMPT_VERSION,SCHEMA_VERSION)
+        self.assertIsNotNone(first);self.assertIsNone(second)
+        old=os.environ.get("GEMINI_MAX_QUEUE");os.environ["GEMINI_MAX_QUEUE"]="99"
+        try:self.assertEqual(GeminiObserver(self.store).queue.maxsize,2)
+        finally:
+            if old is None:os.environ.pop("GEMINI_MAX_QUEUE",None)
+            else:os.environ["GEMINI_MAX_QUEUE"]=old
+
+    def test_status_and_briefings_are_read_only(self) -> None:
+        before=self.store.db.execute("SELECT count(*) FROM boots").fetchone()[0]
+        status=self.store.service_status();items=self.store.list_briefings()
+        self.assertIn("source_health",status);self.assertEqual(items,[])
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM boots").fetchone()[0],before)
+        self.store.close();readonly=Storage(self.data,"not-recorded",ROOT/"migrations",read_only=True)
+        self.assertEqual(readonly.db.execute("SELECT count(*) FROM boots").fetchone()[0],before)
+        readonly.close();self.store=Storage(self.data,"boot-after-read",ROOT/"migrations")
 
 
 if __name__=="__main__":unittest.main()
