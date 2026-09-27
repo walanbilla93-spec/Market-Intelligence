@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import json
 import os
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -12,12 +13,13 @@ from pathlib import Path
 from .adapters import BeaScheduleAdapter, BlsCalendarAdapter, BybitContextAdapter, FedFomcAdapter, FredAdapter, RssAdapter
 from .config import Config
 from .exporter import build_manifest
+from .export_ui import start_export_ui
 from .gemini import GeminiObserver
 from .http import BoundedHttpClient
 from .linkage import import_candidates
 from .models import Event, Observation
 from .storage import Storage
-from .util import iso_utc, utc_now
+from .util import iso_utc, redact_sensitive_text, utc_now
 
 
 def migrations_dir() -> Path:
@@ -53,19 +55,28 @@ async def collect_once(config: Config,storage: Storage) -> dict[str,int]:
                 elif isinstance(row,Observation):storage.add_observation(row);result["observations"]+=1
             storage.health(adapter.name,"OK",attempted,int((time.monotonic()-started)*1000));result["success"]+=1
         except Exception as error:
-            storage.health(adapter.name,"ERROR",attempted,int((time.monotonic()-started)*1000),str(error));result["failed"]+=1
+            storage.health(adapter.name,"ERROR",attempted,int((time.monotonic()-started)*1000),redact_sensitive_text(str(error)));result["failed"]+=1
     await asyncio.gather(*(run(adapter) for adapter in adapters));build_manifest(storage.export_dir);return result
 
 
 async def run_forever(config: Config,storage: Storage) -> None:
     observer=GeminiObserver(storage,config.gemini_enabled,config.gemini_interval_seconds,config.gemini_event_trigger)
     worker=asyncio.create_task(observer.run(),name="gemini-shadow-observer")
+    export_server = None
     try:
+        try:
+            started = start_export_ui(storage.db_path, storage.export_dir, migrations_dir())
+            export_server = started[0] if started else None
+        except Exception as error:
+            # A broken optional UI must never stop collection. Avoid logging token values.
+            print(f"export UI disabled after safe startup failure: {type(error).__name__}: {error}", file=sys.stderr)
         while True:
             await collect_once(config,storage)
             observer.schedule_after_collection()
             await asyncio.sleep(config.poll_seconds)
     finally:
+        if export_server is not None:
+            export_server.shutdown();export_server.server_close()
         worker.cancel()
         with contextlib.suppress(asyncio.CancelledError):await worker
 
