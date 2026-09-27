@@ -15,7 +15,7 @@ An independent, observation-only service for one spare 512 MB instance. It is no
 
 Gemini remains off by default (`MI_GEMINI_ENABLED=false`) and therefore costs nothing. When explicitly enabled, the existing observer runs only inside this service after a collection cycle. It creates at most two briefing records per 30 minutes, uses a queue of at most two items, has a hard request deadline and at most one retry, and opens a circuit breaker after repeated failures. It never imports trading code, credentials, positions, signals, or orders.
 
-Each request uses the fixed stable `gemini-3.8-flash` model, prompt `MARKET_BRIEFING_PROMPT_V1`, and validated JSON schema `MARKET_BRIEFING_V1`. Inputs contain timestamped official calendar rows, configured verified news, source health, and the latest Bybit breadth/BTC/ETH observations. Missing or stale core observations cause a local abstention without an API request. FOMC meeting dates may be official while decision/press clock times remain explicitly labelled assumptions.
+Each request uses the fixed stable `gemini-3.8-flash` model, prompt `MARKET_BRIEFING_PROMPT_V3`, and validated JSON schema `MARKET_BRIEFING_V1`. Inputs contain timestamped official calendar rows, configured verified news, source health, and the latest Bybit breadth/BTC/ETH observations. Missing or stale core observations cause a local abstention without an API request. FOMC meeting dates may be official while decision/press clock times remain explicitly labelled assumptions.
 
 Briefing requests, completions, errors, prompt/model/schema versions, input snapshots and watermarks, latency, token usage when returned, and availability timestamps are stored in the same SQLite database and hourly `briefings-*.jsonl` export. API, quota, timeout, malformed-response, stale-input, disabled, and circuit states are also visible in `source_health`. No briefing is authoritative, connected to New Orayan, or used for automatic rule learning.
 
@@ -54,6 +54,36 @@ For a container, mount a persistent volume at `/data`, set `MI_DATA_DIR=/data`, 
 
 For Northflank Phase 1 setup, see `docs/PHASE1_GEMINI.md`. Keep the included Dockerfile command unchanged and never put a Gemini key in source control, a config file, or chat.
 
+## Optional phone export UI
+
+The service can expose a small, read-only download page from the same process. It is disabled by default and has no shell, trading controls, mutations, or unauthenticated status details. It uses a password-style token form, short-lived in-memory sessions, `HttpOnly Secure SameSite=Strict` cookies, CSRF checks, constant-time credential comparison, throttling, HTTPS enforcement, bounded request threads, and one export at a time. There is no client JavaScript.
+
+To enable it only after reviewing the security trade-off, set runtime variables:
+
+```text
+MI_EXPORT_UI_ENABLED=true
+MI_EXPORT_UI_PORT=8080
+MI_EXPORT_TOKEN=<a randomly generated secret of at least 32 bytes>
+```
+
+Keep `MI_EXPORT_TOKEN` in a Northflank secret group/runtime secret, never in Git. Northflank must route an HTTPS HTTP port to container port `8080`; the server itself binds to `0.0.0.0`. `/healthz` returns only `ok` and no service metadata. Browser downloads use a secure session; scripts can send `Authorization: Bearer <token>` to the same POST download route.
+
+Exports are prepared under `/tmp`, removed after the request, and never duplicated on `/data`. “Everything” bundles contain an online SQLite backup plus sanitized hourly JSONL. Date-limited bundles contain matching hourly JSONL; table-specific downloads contain sanitized events, observations, or briefings JSONL. Every ZIP contains row counts, source health without error details, a source watermark, migration hashes, per-file SHA-256 hashes, and an export manifest. A full database bundle is refused if credential-like content is detected.
+
+Optional safety limits (defaults shown):
+
+```text
+MI_EXPORT_REQUIRE_HTTPS=true
+MI_EXPORT_SESSION_SECONDS=3600
+MI_EXPORT_REQUEST_TIMEOUT_SECONDS=120
+MI_EXPORT_MAX_INPUT_MIB=192
+MI_EXPORT_MAX_ZIP_MIB=192
+MI_EXPORT_TMP_QUOTA_MIB=384
+MI_EXPORT_MAX_HTTP_THREADS=8
+```
+
+See `docs/EXPORT_UI_NORTHFLANK.md` for phone-friendly rollout, backup, rollback, and first-24-hour checks. Enabling any public endpoint adds attack surface; use private/VPC ingress with an authenticated access layer when available.
+
 ## Offline shadow linkage
 
 Export New Orayan prospective JSONL, copy it to this separate instance, then run:
@@ -75,5 +105,5 @@ The importer accepts only `candidate_birth` rows and deduplicates by `candidate_
 
 ## Tests
 
-Run `python -m unittest discover -s tests -v`. Tests cover schedule revisions, no-lookahead availability, restart dedupe, one-way candidate import, JSONL manifests/hashes, BLS timezone conversion, RSS causality, and the disabled/no-key/success/malformed/quota/timeout/stale/network/restart/bounded Gemini paths without paid API requests.
+Run `python -m unittest discover -s tests -v`. Tests cover schedule revisions, no-lookahead availability, restart dedupe, one-way candidate import, JSONL manifests/hashes, BLS timezone conversion, RSS causality, all disabled/no-key/success/malformed/quota/timeout/stale/network/restart/bounded Gemini paths without paid API requests, and export authentication, cookies/headers, CSRF, throttling, concurrent SQLite writes, concurrent JSONL appends, ZIP integrity, hashes, path safety, credential audits, failure isolation, MIME/disposition, and bounded-memory large files.
 
